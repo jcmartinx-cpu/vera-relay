@@ -1,12 +1,13 @@
 {
   "name": "vera-relay",
-  "version": "1.0.0",
-  "description": "WebSocket relay server for Vera IA Personal",
+  "version": "2.0.0",
+  "description": "WebSocket relay server for Vera IA Personal (socket.io polling)",
   "main": "relay.js",
   "scripts": {
     "start": "node relay.js"
   },
   "dependencies": {
+    "socket.io": "^4.8.0",
     "ws": "^8.18.0"
   }
 }
