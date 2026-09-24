@@ -1,126 +1,148 @@
-
-const http      = require('http');
-const WebSocket  = require('ws');
-const crypto     = require('crypto');
+'use strict';
+const http     = require('http');
+const WebSocket = require('ws');
+const crypto   = require('crypto');
+const { Server: SocketIO } = require('socket.io');
 
 const SECRET = process.env.RELAY_SECRET || 'vera-relay-secret';
 const PORT   = Number(process.env.PORT)  || 80;
 
 const server = http.createServer();
-const wss    = new WebSocket.Server({ server });
 
-let agentWs        = null;
-const pendingHttp  = {};
+// socket.io — agente PC usa HTTP polling (pasa ZScaler sin WebSocket)
+const io = new SocketIO(server, {
+    path: '/socket.io',
+    cors: { origin: '*' },
+    transports: ['polling', 'websocket']
+});
+
+// WebSocket nativo — móvil (no pasa por ZScaler)
+const wss = new WebSocket.Server({ noServer: true });
+
+let agentSocket          = null;
+const pendingHttp        = {};
 const pendingHttpTimeout = {};
-const pendingWs    = {};
-let agentPingTimer = null;
+const pendingWs          = {};
 
-wss.on('connection', (ws, req) => {
-    const url = new URL(req.url, 'http://x');
+// ── Agente PC via socket.io ───────────────────────────────────────────────────
+io.on('connection', (socket) => {
+    const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+    if (token !== SECRET) { socket.disconnect(true); return; }
 
-    if (url.pathname === '/agent' && url.searchParams.get('token') === SECRET) {
-        if (agentWs) { try { agentWs.terminate(); } catch (_) {} }
-        agentWs = ws;
-        console.log('[relay] PC agent conectado');
-        agentPingTimer = setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) ws.ping();
-        }, 25000);
-        ws.on('message', handleAgentMessage);
-        ws.on('pong', () => {});
-        ws.on('close', () => {
-            agentWs = null;
-            clearInterval(agentPingTimer);
-            console.log('[relay] PC agent desconectado');
-            Object.entries(pendingHttp).forEach(([id, res]) => {
-                clearTimeout(pendingHttpTimeout[id]);
-                delete pendingHttpTimeout[id];
-                try { res.end(); } catch (_) {}
-                delete pendingHttp[id];
-            });
-            Object.values(pendingWs).forEach(mws => {
-                try { mws.close(1001, 'Agent disconnected'); } catch (_) {}
-            });
-        });
-        return;
-    }
+    if (agentSocket) { try { agentSocket.disconnect(true); } catch (_) {} }
+    agentSocket = socket;
+    console.log('[relay] ✅ PC agent conectado (socket.io)');
 
-    if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
-        ws.close(1001, 'PC not connected');
-        return;
-    }
-    const id = crypto.randomBytes(4).toString('hex');
-    pendingWs[id] = ws;
-    agentWs.send(JSON.stringify({ type: 'ws_open', id, url: req.url, headers: req.headers }));
-    ws.on('message', (data, isBinary) => {
-        if (agentWs?.readyState !== WebSocket.OPEN) return;
-        agentWs.send(JSON.stringify({ type: 'ws_data', id, data: Buffer.from(data).toString('base64'), binary: isBinary }));
+    socket.on('http_resp', (msg) => {
+        const res = pendingHttp[msg.id]; if (!res) return;
+        clearTimeout(pendingHttpTimeout[msg.id]); delete pendingHttpTimeout[msg.id];
+        const hdrs = { ...msg.headers };
+        delete hdrs['transfer-encoding']; delete hdrs['connection'];
+        try { res.writeHead(msg.status, hdrs); res.end(Buffer.from(msg.body || '', 'base64')); } catch (_) {}
+        delete pendingHttp[msg.id];
     });
-    ws.on('close', (code, reason) => {
-        if (agentWs?.readyState === WebSocket.OPEN)
-            agentWs.send(JSON.stringify({ type: 'ws_close', id, code, reason: reason.toString() }));
-        delete pendingWs[id];
+
+    socket.on('http_resp_start', (msg) => {
+        const res = pendingHttp[msg.id]; if (!res) return;
+        clearTimeout(pendingHttpTimeout[msg.id]); delete pendingHttpTimeout[msg.id];
+        const hdrs = { ...msg.headers };
+        delete hdrs['transfer-encoding']; delete hdrs['connection'];
+        try { res.writeHead(msg.status, hdrs); } catch (_) {}
+    });
+
+    socket.on('http_resp_chunk', (msg) => {
+        const res = pendingHttp[msg.id]; if (!res) return;
+        try { res.write(Buffer.from(msg.data, 'base64')); } catch (_) {}
+    });
+
+    socket.on('http_resp_end', (msg) => {
+        const res = pendingHttp[msg.id]; if (!res) return;
+        try { res.end(); } catch (_) {}
+        delete pendingHttp[msg.id];
+    });
+
+    socket.on('ws_data', (msg) => {
+        const mws = pendingWs[msg.id];
+        if (mws?.readyState === WebSocket.OPEN)
+            mws.send(Buffer.from(msg.data, 'base64'), { binary: msg.binary });
+    });
+
+    socket.on('ws_close', (msg) => {
+        const mws = pendingWs[msg.id];
+        if (mws) {
+            try { mws.close(msg.code || 1000, msg.reason || ''); } catch (_) {}
+            delete pendingWs[msg.id];
+        }
+    });
+
+    socket.on('disconnect', (reason) => {
+        if (agentSocket === socket) agentSocket = null;
+        console.log(`[relay] PC agent desconectado: ${reason}`);
+        Object.entries(pendingHttp).forEach(([id, res]) => {
+            clearTimeout(pendingHttpTimeout[id]); delete pendingHttpTimeout[id];
+            try { res.writeHead(503); res.end('Agent disconnected'); } catch (_) {}
+            delete pendingHttp[id];
+        });
+        Object.values(pendingWs).forEach(mws => {
+            try { mws.close(1001, 'Agent disconnected'); } catch (_) {}
+        });
     });
 });
 
+// ── WebSocket del móvil (upgrade nativo, no socket.io) ───────────────────────
+server.on('upgrade', (req, socket, head) => {
+    if (req.url.startsWith('/socket.io')) return; // socket.io lo gestiona solo
+    if (!agentSocket) { socket.destroy(); return; }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        const id = crypto.randomBytes(4).toString('hex');
+        pendingWs[id] = ws;
+        agentSocket.emit('ws_open', { id, url: req.url, headers: req.headers });
+
+        ws.on('message', (data, isBinary) => {
+            if (!agentSocket) return;
+            agentSocket.emit('ws_data', { id, data: Buffer.from(data).toString('base64'), binary: isBinary });
+        });
+        ws.on('close', (code, reason) => {
+            if (agentSocket) agentSocket.emit('ws_close', { id, code, reason: reason.toString() });
+            delete pendingWs[id];
+        });
+        ws.on('error', () => {});
+    });
+});
+
+// ── Peticiones HTTP del móvil ─────────────────────────────────────────────────
 server.on('request', (req, res) => {
+    if (req.url.startsWith('/socket.io')) return; // socket.io lo gestiona
+
     if (req.url === '/health' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end(agentWs ? 'connected' : 'no-agent');
+        res.end(agentSocket ? 'connected' : 'no-agent');
         return;
     }
-    if (!agentWs || agentWs.readyState !== WebSocket.OPEN) {
+    if (!agentSocket) {
         res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end('<h2>PC agent no conectado — ¿está encendido el PC?</h2>');
         return;
     }
-    const id = crypto.randomBytes(4).toString('hex');
+    const id     = crypto.randomBytes(4).toString('hex');
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
         pendingHttp[id] = res;
-        agentWs.send(JSON.stringify({ type: 'http_req', id, method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString('base64') }));
-        const timeoutHandle = setTimeout(() => {
+        agentSocket.emit('http_req', {
+            id, method: req.method, url: req.url,
+            headers: req.headers,
+            body: Buffer.concat(chunks).toString('base64')
+        });
+        pendingHttpTimeout[id] = setTimeout(() => {
             if (pendingHttp[id]) {
-                try { res.writeHead(504, { 'Content-Type': 'text/plain' }); res.end('Gateway Timeout'); } catch (_) {}
+                try { res.writeHead(504); res.end('Gateway Timeout'); } catch (_) {}
                 delete pendingHttp[id];
             }
         }, 60000);
-        pendingHttpTimeout[id] = timeoutHandle;
     });
 });
-
-function handleAgentMessage(raw) {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.type === 'http_resp') {
-        const res = pendingHttp[msg.id]; if (!res) return;
-        clearTimeout(pendingHttpTimeout[msg.id]); delete pendingHttpTimeout[msg.id];
-        const headers = { ...msg.headers };
-        delete headers['transfer-encoding']; delete headers['connection'];
-        try { res.writeHead(msg.status, headers); res.end(Buffer.from(msg.body || '', 'base64')); } catch (_) {}
-        delete pendingHttp[msg.id];
-    } else if (msg.type === 'http_resp_start') {
-        const res = pendingHttp[msg.id]; if (!res) return;
-        clearTimeout(pendingHttpTimeout[msg.id]); delete pendingHttpTimeout[msg.id];
-        const headers = { ...msg.headers };
-        delete headers['transfer-encoding']; delete headers['connection'];
-        try { res.writeHead(msg.status, headers); } catch (_) {}
-    } else if (msg.type === 'http_resp_chunk') {
-        const res = pendingHttp[msg.id]; if (!res) return;
-        try { res.write(Buffer.from(msg.data, 'base64')); } catch (_) {}
-    } else if (msg.type === 'http_resp_end') {
-        const res = pendingHttp[msg.id]; if (!res) return;
-        try { res.end(); } catch (_) {}
-        delete pendingHttp[msg.id];
-    } else if (msg.type === 'ws_data') {
-        const mws = pendingWs[msg.id];
-        if (mws?.readyState === WebSocket.OPEN)
-            mws.send(Buffer.from(msg.data, 'base64'), { binary: msg.binary });
-    } else if (msg.type === 'ws_close') {
-        const mws = pendingWs[msg.id];
-        if (mws) { try { mws.close(msg.code || 1000, msg.reason || ''); } catch (_) {} delete pendingWs[msg.id]; }
-    }
-}
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`[relay] escuchando en :${PORT}  (secret: ${SECRET.slice(0, 4)}****)`);
